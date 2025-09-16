@@ -30,11 +30,16 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.PI
+import java.util.Locale
+
+// ⬇️ 추가: 분류기
+import com.google.mediapipe.examples.poselandmarker.classifier.SquatClassifier
 
 class CameraFragment : Fragment(), PoseLandmarkerHelper.LandmarkerListener {
 
     companion object {
         private const val TAG = "Pose Landmarker"
+        private const val MIN_INFER_INTERVAL_MS = 100L  // 추론 최소 간격(너무 과도한 호출 방지)
     }
 
     private var _fragmentCameraBinding: FragmentCameraBinding? = null
@@ -48,8 +53,12 @@ class CameraFragment : Fragment(), PoseLandmarkerHelper.LandmarkerListener {
     private var cameraProvider: ProcessCameraProvider? = null
     private var cameraFacing = CameraSelector.LENS_FACING_BACK
 
-    /** Blocking ML operations are performed using this executor */
+    /** ML/분류 등 블로킹 작업용 실행기 */
     private lateinit var backgroundExecutor: ExecutorService
+
+    /** ⬇️ 추가: TFLite 분류기 */
+    private var classifier: SquatClassifier? = null
+    private var lastInferTime = 0L
 
     override fun onResume() {
         super.onResume()
@@ -71,7 +80,7 @@ class CameraFragment : Fragment(), PoseLandmarkerHelper.LandmarkerListener {
     override fun onPause() {
         super.onPause()
         if (this::poseLandmarkerHelper.isInitialized) {
-            // 현재 값 저장(원하시면 유지/삭제하셔도 됩니다)
+            // 현재 값 저장(필요시)
             viewModel.setMinPoseDetectionConfidence(poseLandmarkerHelper.minPoseDetectionConfidence)
             viewModel.setMinPoseTrackingConfidence(poseLandmarkerHelper.minPoseTrackingConfidence)
             viewModel.setMinPosePresenceConfidence(poseLandmarkerHelper.minPosePresenceConfidence)
@@ -85,6 +94,11 @@ class CameraFragment : Fragment(), PoseLandmarkerHelper.LandmarkerListener {
         _fragmentCameraBinding = null
         super.onDestroyView()
 
+        // 분류기 자원 해제
+        classifier?.close()
+        classifier = null
+
+        // 백그라운드 실행기 종료
         backgroundExecutor.shutdown()
         backgroundExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS)
     }
@@ -108,26 +122,32 @@ class CameraFragment : Fragment(), PoseLandmarkerHelper.LandmarkerListener {
         // View가 배치된 다음 카메라 셋업
         fragmentCameraBinding.viewFinder.post { setUpCamera() }
 
-        // PoseLandmarkerHelper 생성: 임계값=0.5, delegate=CPU, 모델=Lite(인덱스 0)
+        // PoseLandmarkerHelper 생성 + 모델 준비
         backgroundExecutor.execute {
             poseLandmarkerHelper = PoseLandmarkerHelper(
                 context = requireContext(),
                 runningMode = RunningMode.LIVE_STREAM,
-                minPoseDetectionConfidence = 0.5f,  // 🔧 고정
-                minPoseTrackingConfidence = 0.5f,   // 🔧 고정
-                minPosePresenceConfidence = 0.5f,   // 🔧 고정
-                currentDelegate = PoseLandmarkerHelper.DELEGATE_CPU, // 🔧 CPU 기본값
+                minPoseDetectionConfidence = 0.5f,
+                minPoseTrackingConfidence = 0.5f,
+                minPosePresenceConfidence = 0.5f,
+                currentDelegate = PoseLandmarkerHelper.DELEGATE_CPU,
                 poseLandmarkerHelperListener = this
             )
-            // 🔧 모델 Lite로 고정 (일반적으로 0이 Lite)
             try {
-                // 상수가 있다면: poseLandmarkerHelper.currentModel = PoseLandmarkerHelper.MODEL_LITE
+                // Lite 모델 인덱스 가정(필요 시 상수 사용)
                 poseLandmarkerHelper.currentModel = 0
-                // 모델 반영을 위해 재초기화
                 poseLandmarkerHelper.clearPoseLandmarker()
                 poseLandmarkerHelper.setupPoseLandmarker()
             } catch (e: Exception) {
                 Log.w(TAG, "모델 설정 중 예외 발생: ${e.message}")
+            }
+
+            // ⬇️ TFLite 분류기 준비(assets/model.tflite 가정)
+            try {
+                classifier = SquatClassifier(requireContext())
+                Log.i(TAG, "SquatClassifier initialized.")
+            } catch (e: Exception) {
+                Log.e(TAG, "분류기 초기화 실패: ${e.message}")
             }
         }
     }
@@ -196,33 +216,86 @@ class CameraFragment : Fragment(), PoseLandmarkerHelper.LandmarkerListener {
         imageAnalyzer?.targetRotation = fragmentCameraBinding.viewFinder.display.rotation
     }
 
-    // 결과 수신: 바텀시트가 없으므로 텍스트 업데이트 제거, 오버레이만 갱신
+    // 결과 수신: 오버레이 갱신 + 좌표/각도 → 분류기 호출
     override fun onResults(resultBundle: PoseLandmarkerHelper.ResultBundle) {
         activity?.runOnUiThread {
-            if (_fragmentCameraBinding != null) {
-                fragmentCameraBinding.overlay.setResults(
-                    resultBundle.results.first(),
-                    resultBundle.inputImageHeight,
-                    resultBundle.inputImageWidth,
-                    RunningMode.LIVE_STREAM
-                )
+            if (_fragmentCameraBinding == null) return@runOnUiThread
 
-                // 각도 계산 로그
-                val angles = computeAnglesFrom(
-                    resultBundle.results.first(),
-                    resultBundle.inputImageWidth,
-                    resultBundle.inputImageHeight
-                )
-                Log.d(
-                    TAG,
-                    "Angles -> Rknee=${"%.1f".format(angles.Rknee_angle)}, " +
-                            "Lknee=${"%.1f".format(angles.Lknee_angle)}, " +
-                            "Rhip=${"%.1f".format(angles.Rhip_angle)}, " +
-                            "Lhip=${"%.1f".format(angles.Lhip_angle)}"
-                )
-
+            val resultsList = resultBundle.results
+            if (resultsList.isEmpty()) {
+                Log.d(TAG, "No landmarks in this frame")
+                fragmentCameraBinding.overlay.clear()
                 fragmentCameraBinding.overlay.invalidate()
+                return@runOnUiThread
             }
+
+            val poseResult = resultsList.first()
+
+            fragmentCameraBinding.overlay.setResults(
+                poseResult,
+                resultBundle.inputImageHeight,
+                resultBundle.inputImageWidth,
+                RunningMode.LIVE_STREAM
+            )
+
+            // 좌표 + 각도 추출
+            val log = extractPoseLog(
+                poseResult,
+                resultBundle.inputImageWidth,
+                resultBundle.inputImageHeight
+            )
+
+            // (선택) 디버그: 원본 feature 로깅
+            if (log != null) {
+                Log.d(
+                    TAG, String.format(
+                        Locale.US,
+                        "Rshoulder_x=%.1f, Rshoulder_y=%.1f, Lshoulder_x=%.1f, Lshoulder_y=%.1f, " +
+                                "Rhip_x=%.1f, Rhip_y=%.1f, Lhip_x=%.1f, Lhip_y=%.1f, " +
+                                "Rknee_x=%.1f, Rknee_y=%.1f, Lknee_x=%.1f, Lknee_y=%.1f, " +
+                                "Rankle_x=%.1f, Rankle_y=%.1f, Lankle_x=%.1f, Lankle_y=%.1f, " +
+                                "Rknee_angle=%.1f, Lknee_angle=%.1f, Rhip_angle=%.1f, Lhip_angle=%.1f",
+                        log.Rshoulder_x, log.Rshoulder_y, log.Lshoulder_x, log.Lshoulder_y,
+                        log.Rhip_x, log.Rhip_y, log.Lhip_x, log.Lhip_y,
+                        log.Rknee_x, log.Rknee_y, log.Lknee_x, log.Lknee_y,
+                        log.Rankle_x, log.Rankle_y, log.Lankle_x, log.Lankle_y,
+                        log.Rknee_angle, log.Lknee_angle, log.Rhip_angle, log.Lhip_angle
+                    )
+                )
+            }
+
+            // 분류 호출 (throttle)
+            val now = System.currentTimeMillis()
+            if (log != null && (now - lastInferTime) >= MIN_INFER_INTERVAL_MS) {
+                lastInferTime = now
+
+                // ⬇️ 분류 입력 vector 생성
+                val features = floatArrayOf(
+                    log.Rshoulder_x.toFloat(), log.Rshoulder_y.toFloat(),
+                    log.Lshoulder_x.toFloat(), log.Lshoulder_y.toFloat(),
+                    log.Rhip_x.toFloat(), log.Rhip_y.toFloat(),
+                    log.Lhip_x.toFloat(), log.Lhip_y.toFloat(),
+                    log.Rknee_x.toFloat(), log.Rknee_y.toFloat(),
+                    log.Lknee_x.toFloat(), log.Lknee_y.toFloat(),
+                    log.Rankle_x.toFloat(), log.Rankle_y.toFloat(),
+                    log.Lankle_x.toFloat(), log.Lankle_y.toFloat(),
+                    log.Rknee_angle.toFloat(), log.Lknee_angle.toFloat(),
+                    log.Rhip_angle.toFloat(), log.Lhip_angle.toFloat()
+                )
+
+                // ⬇️ 백그라운드에서 추론 실행
+                backgroundExecutor.execute {
+                    val pred = try {
+                        classifier?.predict(features) ?: -1
+                    } catch (e: Exception) {
+                        Log.e(TAG, "분류 실패: ${e.message}")
+                        -1
+                    }
+                    Log.d("SquatClassifier", "Result = $pred") // 0/1/2 출력
+                }
+            }
+
+            fragmentCameraBinding.overlay.invalidate()
         }
     }
 
@@ -230,7 +303,7 @@ class CameraFragment : Fragment(), PoseLandmarkerHelper.LandmarkerListener {
         activity?.runOnUiThread {
             Toast.makeText(requireContext(), error, Toast.LENGTH_SHORT).show()
         }
-        // 바텀시트가 없으므로 GPU 오류 시 자동으로 CPU로 전환
+        // GPU 오류 시 CPU로 자동 전환
         if (errorCode == PoseLandmarkerHelper.GPU_ERROR && this::poseLandmarkerHelper.isInitialized) {
             backgroundExecutor.execute {
                 try {
@@ -246,7 +319,7 @@ class CameraFragment : Fragment(), PoseLandmarkerHelper.LandmarkerListener {
     }
 
     // --------------------------
-    // ⬇️ 각도 계산 헬퍼
+    // ⬇️ 각도/로깅 헬퍼
     // --------------------------
     data class Pt(val x: Double, val y: Double)
     data class PoseAngles(
@@ -291,5 +364,56 @@ class CameraFragment : Fragment(), PoseLandmarkerHelper.LandmarkerListener {
         val LhipAngle  = 180 - calculateAngle(Lshoulder, Lhip, Lknee)
 
         return PoseAngles(RkneeAngle, LkneeAngle, RhipAngle, LhipAngle)
+    }
+
+    // 16개 좌표 + 4개 각도 한 번에 담는 구조
+    data class PoseLog(
+        val Rshoulder_x: Double, val Rshoulder_y: Double,
+        val Lshoulder_x: Double, val Lshoulder_y: Double,
+        val Rhip_x: Double, val Rhip_y: Double,
+        val Lhip_x: Double, val Lhip_y: Double,
+        val Rknee_x: Double, val Rknee_y: Double,
+        val Lknee_x: Double, val Lknee_y: Double,
+        val Rankle_x: Double, val Rankle_y: Double,
+        val Lankle_x: Double, val Lankle_y: Double,
+        val Rknee_angle: Double, val Lknee_angle: Double,
+        val Rhip_angle: Double, val Lhip_angle: Double
+    )
+
+    // 결과에서 좌표/각도 모두 추출 (없거나 부족하면 null)
+    private fun extractPoseLog(
+        result: com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult,
+        imageWidth: Int,
+        imageHeight: Int
+    ): PoseLog? {
+        val lm = result.landmarks().firstOrNull() ?: return null
+        if (lm.size <= 28) return null  // 인덱스 안전 가드
+
+        fun p(i: Int) = Pt(
+            x = lm[i].x().toDouble() * imageWidth,
+            y = lm[i].y().toDouble() * imageHeight
+        )
+
+        val Rshoulder = p(12); val Lshoulder = p(11)
+        val Rhip      = p(24); val Lhip      = p(23)
+        val Rknee     = p(26); val Lknee     = p(25)
+        val Rankle    = p(28); val Lankle    = p(27)
+
+        val RkneeAngle = 180 - calculateAngle(Rhip, Rknee, Rankle)
+        val LkneeAngle = 180 - calculateAngle(Lhip, Lknee, Lankle)
+        val RhipAngle  = 180 - calculateAngle(Rshoulder, Rhip, Rknee)
+        val LhipAngle  = 180 - calculateAngle(Lshoulder, Lhip, Lknee)
+
+        return PoseLog(
+            Rshoulder.x, Rshoulder.y,
+            Lshoulder.x, Lshoulder.y,
+            Rhip.x, Rhip.y,
+            Lhip.x, Lhip.y,
+            Rknee.x, Rknee.y,
+            Lknee.x, Lknee.y,
+            Rankle.x, Rankle.y,
+            Lankle.x, Lankle.y,
+            RkneeAngle, LkneeAngle, RhipAngle, LhipAngle
+        )
     }
 }

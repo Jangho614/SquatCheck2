@@ -98,4 +98,7 @@ dependencies {
 
     // MediaPipe Library
     implementation 'com.google.mediapipe:tasks-vision:0.10.26'
+
+    implementation("org.tensorflow:tensorflow-lite:2.14.0")
+
 }
