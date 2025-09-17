@@ -91,7 +91,7 @@
                             android:id="@+id/txtCurrentScore"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="좋아요!"
+                            android:text="스쿼트!"
                             android:textColor="#00AA55"
                             android:textSize="28sp"
                             android:textStyle="bold"
@@ -136,9 +136,9 @@
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="8dp"
-                            android:text="12"
+                            android:text="0"
                             android:textColor="#00AA55"
-                            android:textSize="24sp"
+                            android:textSize="18sp"
                             android:textStyle="bold" />
 
                         <TextView
@@ -179,9 +179,9 @@
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="8dp"
-                            android:text="78.5"
+                            android:text="0"
                             android:textColor="#FF6B35"
-                            android:textSize="24sp"
+                            android:textSize="18sp"
                             android:textStyle="bold" />
 
                         <TextView
@@ -222,9 +222,9 @@
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="8dp"
-                            android:text="60%"
+                            android:text="0"
                             android:textColor="#4A90E2"
-                            android:textSize="24sp"
+                            android:textSize="18sp"
                             android:textStyle="bold" />
 
                         <TextView
@@ -239,13 +239,13 @@
 
             <!-- 컨트롤 버튼 영역 -->
             <androidx.appcompat.widget.AppCompatButton
-                android:id="@+id/btnStartStop"
+                android:id="@+id/ChangeCamera"
                 android:layout_width="match_parent"
                 android:layout_height="48dp"
                 android:layout_gravity="center"
                 android:background="@drawable/btn_cam_start"
                 android:paddingHorizontal="32dp"
-                android:text="스쿼트 시작"
+                android:text="카메라 전환"
                 android:textColor="#fff"
                 android:textSize="16sp"
                 android:textStyle="bold" />

@@ -6,7 +6,7 @@ import java.io.FileInputStream
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 
-class SquatClassifier(context: Context, modelAssetPath: String = "model.tflite") {
+class SquatClassifier(context: Context, modelAssetPath: String = "squat_model_with_scaler.tflite") {
     private val interpreter: Interpreter
 
     init {
